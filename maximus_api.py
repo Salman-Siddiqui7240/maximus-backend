@@ -1,6 +1,10 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import os
+import json
+import asyncio
 import datetime
+import requests
+from bs4 import BeautifulSoup
 from groq import AsyncGroq
 
 app = FastAPI(title="Maximus Cloud Core")
@@ -13,6 +17,9 @@ except Exception as e:
     print(f"[SYSTEM FAULT]: Groq Engine failed to initialize: {e}")
     client = None
 
+FIRECRAWL_API_KEY = os.environ.get("FIRECRAWL_API_KEY", "")
+FOOTBALL_API_KEY = os.environ.get("FOOTBALL_API_KEY", "")
+
 # ── FULL SYSTEM PROMPT ───────────────────────────────────────────────────────
 def build_system_prompt():
     utc_now = datetime.datetime.utcnow()
@@ -23,7 +30,7 @@ def build_system_prompt():
 [LIVE SYSTEM DIAGNOSTICS]
 Current Local Time (IST): {current_time}
 You are operating in 2026. Never hallucinate dates.
-Knowledge cutoff is 2023. For anything after 2023, clearly state you may not have current data.
+Knowledge cutoff is 2023, but you have LIVE WEB SEARCH AND API TOOLS to fetch current data.
 
 # CORE IDENTITY
 You are Maximus — a Tri-Hybrid cognitive intelligence engineered by Salman Siddiqui.
@@ -85,6 +92,72 @@ def get_tactical_greeting():
         f"All cognitive layers are online. What are your orders?"
     )
 
+# ── DATA TRUNCATOR ───────────────────────────────────────────────────────────
+def truncate_data(raw_data, max_chars=4000):
+    if len(raw_data) > max_chars:
+        print(f"[MAXIMUS LOG]: Payload critical ({len(raw_data)} chars). Slicing to {max_chars}...")
+        return raw_data[:max_chars] + "\n...[DATA TRUNCATED TO PREVENT MATRIX OVERFLOW]"
+    return raw_data
+
+# ── SYNCHRONOUS TOOL SCRAPERS ────────────────────────────────────────────────
+def fetch_webpage_sync(url):
+    if FIRECRAWL_API_KEY:
+        try:
+            from firecrawl import FirecrawlApp
+            app = FirecrawlApp(api_key=FIRECRAWL_API_KEY)
+            scrape_result = app.scrape_url(url, params={'formats': ['markdown']})
+            markdown_data = scrape_result.get('markdown', '')
+            if markdown_data:
+                return truncate_data(markdown_data, 4000)
+        except Exception:
+            pass # Fallback
+
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        response = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        for script in soup(["script", "style"]):
+            script.extract()
+        text = soup.get_text(separator=' ', strip=True)
+        return truncate_data(text, 4000) if text else "[SYSTEM ERROR: No text found.]"
+    except Exception as e:
+        return f"[SYSTEM ERROR: Local fetch failed. Error: {e}]"
+
+def fetch_football_standings_sync(league_code):
+    if not FOOTBALL_API_KEY: return "[SYSTEM ERROR: Football API Key missing.]"
+    headers = {'X-Auth-Token': FOOTBALL_API_KEY}
+    url = f"http://api.football-data.org/v4/competitions/{league_code}/standings"
+    try:
+        res = requests.get(url, headers=headers, timeout=8)
+        if res.status_code != 200: return f"[API ERROR: {res.text}]"
+        data = res.json()
+        standings = data.get('standings', [])[0].get('table', [])
+        output = f"--- {data.get('competition', {}).get('name', league_code)} STANDINGS ---\n"
+        for row in standings:
+            output += f"{row.get('position')}. {row.get('team', {}).get('name', 'Unknown')} | Pts: {row.get('points')} | Played: {row.get('playedGames')}\n"
+        return truncate_data(output, 4000)
+    except Exception as e:
+        return f"[SYSTEM ERROR: {e}]"
+
+groq_tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_webpage",
+            "description": "Fetches text content from a URL. Use this to read live news, stats, or search results.",
+            "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_football_standings",
+            "description": "Fetches current football standings. League codes: PL (Premier League), PD (La Liga), SA (Serie A), BL1 (Bundesliga), FL1 (Ligue 1).",
+            "parameters": {"type": "object", "properties": {"league_code": {"type": "string"}}, "required": ["league_code"]}
+        }
+    }
+]
+
 # ── TASK CLASSIFIER ──────────────────────────────────────────────────────────
 async def analyze_task_complexity(user_query):
     if not client:
@@ -93,11 +166,7 @@ async def analyze_task_complexity(user_query):
         classifier = [
             {
                 "role": "system",
-                "content": (
-                    "You are a routing node. Analyze the user query. "
-                    "Reply with ONLY '70B' for coding, math, deep analysis, multi-step logic. "
-                    "Reply with ONLY '8B' for casual chat, greetings, simple questions."
-                )
+                "content": "You are a routing node. Reply ONLY '70B' for heavy reasoning, coding, web searches, or football stats. Reply ONLY '8B' for casual chat."
             },
             {"role": "user", "content": user_query}
         ]
@@ -110,13 +179,6 @@ async def analyze_task_complexity(user_query):
         return "70B" in response.choices[0].message.content.strip()
     except Exception:
         return False
-
-# ── DATA TRUNCATOR ───────────────────────────────────────────────────────────
-def truncate_data(raw_data, max_chars=4000):
-    if len(raw_data) > max_chars:
-        print(f"[MAXIMUS LOG]: Payload critical ({len(raw_data)} chars). Slicing to {max_chars}...")
-        return raw_data[:max_chars] + "\n...[DATA TRUNCATED TO PREVENT MATRIX OVERFLOW]"
-    return raw_data
 
 # ── HEALTH CHECK ────────────────────────────────────────────────────────────
 @app.get("/")
@@ -131,12 +193,10 @@ def health_check():
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
 
-    # Build fresh system prompt with current time
     system_prompt  = build_system_prompt()
     base_prompt    = {"role": "system", "content": system_prompt}
     session_messages = [base_prompt]
 
-    # Push greeting immediately on connect
     greeting = get_tactical_greeting()
     await websocket.send_json({"type": "greeting", "response": greeting})
 
@@ -145,49 +205,69 @@ async def websocket_endpoint(websocket: WebSocket):
             data      = await websocket.receive_json()
             user_text = data.get("query", "").strip()
 
-            if not user_text:
-                continue
+            if not user_text: continue
 
-            # Fail-safe: brain offline check
             if not client:
-                await websocket.send_json({
-                    "type": "error",
-                    "response": "CRITICAL FAULT: Groq Engine offline. Check Render Environment Vault for GROQ_API_KEY."
-                })
+                await websocket.send_json({"type": "error", "response": "CRITICAL FAULT: Groq Engine offline. Check Render Environment Vault."})
                 continue
 
-            # Memory pruner
             if len(session_messages) > 11:
                 session_messages = [session_messages[0]] + session_messages[-10:]
 
             session_messages.append({"role": "user", "content": user_text})
 
-            # Dual-engine router
             is_heavy     = await analyze_task_complexity(user_text)
             active_model = "llama-3.3-70b-versatile" if is_heavy else "llama-3.1-8b-instant"
 
-            await websocket.send_json({
-                "type": "status",
-                "message": f"Routing to {active_model}..."
-            })
+            await websocket.send_json({"type": "status", "message": f"Routing to {active_model}..."})
 
-            # Cognitive strike
+            # STRIKE 1: Check if Tools are needed
             chat_completion = await client.chat.completions.create(
                 model=active_model,
                 messages=session_messages,
-                temperature=0.6
+                temperature=0.6,
+                tools=groq_tools,
+                tool_choice="auto"
             )
-            maximus_response = chat_completion.choices[0].message.content
 
-            # Truncate before storing in history
+            response_msg = chat_completion.choices[0].message
+            
+            # If Maximus decides to use a tool
+            if response_msg.tool_calls:
+                session_messages.append(response_msg.model_dump(exclude_unset=True))
+                
+                for tool_call in response_msg.tool_calls:
+                    func_name = tool_call.function.name
+                    args = json.loads(tool_call.function.arguments)
+                    
+                    await websocket.send_json({"type": "status", "message": f"Executing protocol: {func_name}..."})
+                    
+                    # RUN ASYNC TO PREVENT SERVER FREEZE
+                    if func_name == "fetch_webpage":
+                        result = await asyncio.to_thread(fetch_webpage_sync, args.get("url"))
+                    elif func_name == "fetch_football_standings":
+                        result = await asyncio.to_thread(fetch_football_standings_sync, args.get("league_code"))
+                    else:
+                        result = "[ERROR: Unknown tool]"
+                        
+                    session_messages.append({"role": "tool", "tool_call_id": tool_call.id, "name": func_name, "content": result})
+                
+                await websocket.send_json({"type": "status", "message": "Analyzing extracted data..."})
+                
+                # STRIKE 2: Generate final answer with new live data
+                chat_completion = await client.chat.completions.create(
+                    model=active_model,
+                    messages=session_messages,
+                    temperature=0.6
+                )
+                maximus_response = chat_completion.choices[0].message.content
+            else:
+                maximus_response = response_msg.content
+
             clean_response = truncate_data(maximus_response, max_chars=6000)
             session_messages.append({"role": "assistant", "content": clean_response})
 
-            await websocket.send_json({
-                "type": "response",
-                "response": maximus_response,
-                "engine": active_model
-            })
+            await websocket.send_json({"type": "response", "response": maximus_response, "engine": active_model})
 
         except WebSocketDisconnect:
             print("[SYSTEM] Client disconnected cleanly.")
@@ -195,9 +275,6 @@ async def websocket_endpoint(websocket: WebSocket):
         except Exception as e:
             print(f"[FATAL ERROR]: {str(e)}")
             try:
-                await websocket.send_json({
-                    "type": "error",
-                    "response": f"Matrix fault intercepted, Sir. Details: {str(e)}"
-                })
+                await websocket.send_json({"type": "error", "response": f"Matrix fault intercepted, Sir. Details: {str(e)}"})
             except Exception:
                 break
