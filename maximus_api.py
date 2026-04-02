@@ -161,10 +161,22 @@ async def analyze_task_complexity(user_query):
     if not client: return False
     try:
         classifier = [
-            {"role": "system", "content": "Reply ONLY '70B' for heavy reasoning, web searches, deep scraping, or football stats. Reply ONLY '8B' for casual chat."},
+            {
+                "role": "system", 
+                "content": (
+                    "You are a routing node. Analyze the query. "
+                    "Reply ONLY '70B' if the query asks for ANY facts, names, current events, sports data, web searches, coding, or heavy reasoning. "
+                    "Reply ONLY '8B' if the query is PURELY casual small talk (e.g., 'hello', 'goodnight', 'how are you')."
+                )
+            },
             {"role": "user", "content": user_query}
         ]
-        response = await client.chat.completions.create(model="llama-3.1-8b-instant", messages=classifier, max_tokens=5, temperature=0.0)
+        response = await client.chat.completions.create(
+            model="llama-3.1-8b-instant", 
+            messages=classifier, 
+            max_tokens=5, 
+            temperature=0.0
+        )
         return "70B" in response.choices[0].message.content.strip()
     except Exception:
         return False
