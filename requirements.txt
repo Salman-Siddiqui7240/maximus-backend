@@ -6,3 +6,4 @@ groq
 requests
 beautifulsoup4
 firecrawl-py
+tavily-python
